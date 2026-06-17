@@ -46,10 +46,10 @@ struct FailingFileSystem {
 impl FailingFileSystem {
     async fn canonicalize(
         &self,
-        _path: &PathUri,
+        path: &PathUri,
         _sandbox: Option<&FileSystemSandboxContext>,
     ) -> io::Result<PathUri> {
-        unreachable!("canonicalize should not be called")
+        Ok(path.clone())
     }
 
     async fn read_file(
@@ -284,6 +284,7 @@ fn resolved_local_environments<const N: usize>(
 fn project_provenance(path: AbsolutePathBuf, cwd: AbsolutePathBuf) -> InstructionProvenance {
     InstructionProvenance::Project {
         source_path: PathUri::from_abs_path(&path),
+        source_kind: InstructionSourceKind::Primary,
         environment_id: "local".to_string(),
         cwd: PathUri::from_abs_path(&cwd),
     }
@@ -309,6 +310,7 @@ fn foreign_agents_md_uses_environment_native_paths() {
             contents: "remote instructions".to_string(),
             provenance: InstructionProvenance::Project {
                 source_path: source_path.clone(),
+                source_kind: InstructionSourceKind::Primary,
                 environment_id: "remote".to_string(),
                 cwd,
             },
@@ -321,8 +323,11 @@ fn foreign_agents_md_uses_environment_native_paths() {
             "# AGENTS.md instructions for {rendered_cwd}
 
 <INSTRUCTIONS>
+{}
+
 remote instructions
-</INSTRUCTIONS>"
+</INSTRUCTIONS>",
+            source_heading(&source_path, InstructionSourceKind::Primary)
         )
     );
     assert_eq!(loaded.sources().collect::<Vec<_>>(), vec![source_path]);
@@ -343,6 +348,7 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
                 contents: "POSIX instructions".to_string(),
                 provenance: InstructionProvenance::Project {
                     source_path: posix_source.clone(),
+                    source_kind: InstructionSourceKind::Primary,
                     environment_id: "posix".to_string(),
                     cwd: posix_cwd,
                 },
@@ -351,6 +357,7 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
                 contents: "Windows instructions".to_string(),
                 provenance: InstructionProvenance::Project {
                     source_path: windows_source.clone(),
+                    source_kind: InstructionSourceKind::Primary,
                     environment_id: "windows".to_string(),
                     cwd: windows_cwd,
                 },
@@ -360,22 +367,60 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
 
     assert_eq!(
         loaded.render(),
-        r#"# AGENTS.md instructions
+        format!(
+            r#"# AGENTS.md instructions
 
 <INSTRUCTIONS>
 for `posix` with root /srv/project
+
+{}
 
 POSIX instructions
 
 for `windows` with root C:\workspace
 
+{}
+
 Windows instructions
-</INSTRUCTIONS>"#
+</INSTRUCTIONS>"#,
+            source_heading(&posix_source, InstructionSourceKind::Primary),
+            source_heading(&windows_source, InstructionSourceKind::Primary)
+        )
     );
     assert_eq!(
         loaded.sources().collect::<Vec<_>>(),
         vec![posix_source, windows_source]
     );
+}
+
+fn project_provenance_with_kind(
+    path: AbsolutePathBuf,
+    cwd: AbsolutePathBuf,
+    source_kind: InstructionSourceKind,
+) -> InstructionProvenance {
+    InstructionProvenance::Project {
+        source_path: PathUri::from_abs_path(&path),
+        source_kind,
+        environment_id: "local".to_string(),
+        cwd: PathUri::from_abs_path(&cwd),
+    }
+}
+
+fn source_text(source_path: &AbsolutePathBuf, contents: &str) -> String {
+    let heading = source_heading(
+        &PathUri::from_abs_path(source_path),
+        InstructionSourceKind::Primary,
+    );
+    format!("{heading}\n\n{contents}")
+}
+
+fn source_text_with_kind(
+    source_path: &AbsolutePathBuf,
+    source_kind: InstructionSourceKind,
+    contents: &str,
+) -> String {
+    let heading = source_heading(&PathUri::from_abs_path(source_path), source_kind);
+    format!("{heading}\n\n{contents}")
 }
 
 /// Helper that returns a `Config` pointing at `root` and using `limit` as
@@ -524,8 +569,9 @@ async fn doc_smaller_than_limit_is_returned() {
             .expect("doc expected");
 
     assert_eq!(
-        res, "hello world",
-        "The document should be returned verbatim when it is smaller than the limit and there are no existing instructions"
+        res,
+        source_text(&tmp.path().join("AGENTS.md").abs(), "hello world"),
+        "The document should be returned verbatim when it fits the limit and no existing instructions are present"
     );
 }
 
@@ -538,7 +584,7 @@ async fn project_doc_invalid_utf8_uses_lossy_text() {
     let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
     let res = load_agents_md(&config).await.expect("doc expected").text();
 
-    assert_eq!(res, "project\u{FFFD} doc");
+    assert_eq!(res, source_text(&path.abs(), "project\u{FFFD} doc"));
 }
 
 /// Oversize file is truncated to `project_doc_max_bytes`.
@@ -550,12 +596,20 @@ async fn doc_larger_than_limit_is_truncated() {
     let huge = "A".repeat(LIMIT * 2); // 2 KiB
     fs::write(tmp.path().join("AGENTS.md"), &huge).unwrap();
 
-    let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
-        .await
-        .expect("doc expected");
+    let config = make_config(&tmp, LIMIT, /*instructions*/ None).await;
+    let loaded = load_agents_md(&config).await.expect("doc expected");
 
-    assert_eq!(res.len(), LIMIT, "doc should be truncated to LIMIT bytes");
-    assert_eq!(res, huge[..LIMIT]);
+    let entry = loaded.entries.first().expect("project entry");
+    assert_eq!(
+        entry.contents.len(),
+        LIMIT,
+        "doc should be truncated to LIMIT bytes"
+    );
+    assert_eq!(entry.contents, huge[..LIMIT]);
+    assert_eq!(
+        loaded.text(),
+        source_text(&config.cwd.join("AGENTS.md"), &huge[..LIMIT])
+    );
 }
 
 #[tokio::test]
@@ -589,7 +643,14 @@ async fn total_byte_limit_truncates_later_project_docs() {
     };
 
     assert_eq!(loaded, expected);
-    assert_eq!(loaded.text(), "root\n\nabc");
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "{}\n\n{}",
+            source_text(&repo.path().join("AGENTS.md").abs(), "root"),
+            source_text(&config.cwd.join("AGENTS.md"), "abc")
+        )
+    );
 }
 
 #[tokio::test]
@@ -671,7 +732,10 @@ async fn finds_doc_in_repo_root() {
     cfg.cwd = nested.abs();
 
     let res = get_user_instructions(&cfg).await.expect("doc expected");
-    assert_eq!(res, "root level doc");
+    assert_eq!(
+        res,
+        source_text(&repo.path().join("AGENTS.md").abs(), "root level doc")
+    );
 }
 
 /// Explicitly setting the byte-limit to zero disables project docs.
@@ -701,7 +765,10 @@ async fn merges_existing_instructions_with_agents_md() {
         .await
         .expect("should produce a combined instruction string");
 
-    let expected = format!("{INSTRUCTIONS}{AGENTS_MD_SEPARATOR}{}", "proj doc");
+    let expected = format!(
+        "{INSTRUCTIONS}{AGENTS_MD_SEPARATOR}{}",
+        source_text(&tmp.path().join("AGENTS.md").abs(), "proj doc")
+    );
 
     assert_eq!(res, expected);
 }
@@ -727,18 +794,25 @@ async fn multiple_environment_docs_use_labeled_layout_and_preserve_source_order(
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
         .expect("instructions expected");
+    let primary_root_text =
+        source_text(&primary.path().join("AGENTS.md").abs(), "primary root doc");
+    let primary_nested_text = source_text(
+        &primary_nested.join("AGENTS.md").abs(),
+        "primary nested doc",
+    );
+    let secondary_text = source_text(&secondary.path().join("AGENTS.md").abs(), "secondary doc");
     let inner = format!(
         r#"global instructions
 
 for `primary` with root {}
 
-primary root doc
+{primary_root_text}
 
-primary nested doc
+{primary_nested_text}
 
 for `secondary` with root {}
 
-secondary doc"#,
+{secondary_text}"#,
         primary_nested.display(),
         secondary.path().display(),
     );
@@ -785,7 +859,10 @@ async fn secondary_only_project_doc_uses_single_contributor_layout() {
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
         .expect("instructions expected");
-    let inner = format!("global instructions{AGENTS_MD_SEPARATOR}secondary doc");
+    let inner = format!(
+        "global instructions{AGENTS_MD_SEPARATOR}{}",
+        source_text(&secondary.path().join("AGENTS.md").abs(), "secondary doc")
+    );
 
     assert_eq!(loaded.legacy_text(), inner);
     assert_eq!(loaded.text(), inner);
@@ -811,7 +888,10 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
         .expect("instructions expected");
-    let inner = format!("global instructions{AGENTS_MD_SEPARATOR}primary doc");
+    let inner = format!(
+        "global instructions{AGENTS_MD_SEPARATOR}{}",
+        source_text(&primary.path().join("AGENTS.md").abs(), "primary doc")
+    );
 
     assert_eq!(loaded.legacy_text(), inner);
     assert_eq!(loaded.text(), inner);
@@ -842,9 +922,11 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
     assert_eq!(
         loaded.text(),
         format!(
-            "for `primary` with root {}\n\nABC\n\nfor `secondary` with root {}\n\nVWX",
+            "for `primary` with root {}\n\n{}\n\nfor `secondary` with root {}\n\n{}",
             primary.path().display(),
-            secondary.path().display()
+            source_text(&primary.path().join("AGENTS.md").abs(), "ABC"),
+            secondary.path().display(),
+            source_text(&secondary.path().join("AGENTS.md").abs(), "VWX")
         )
     );
 }
@@ -965,7 +1047,14 @@ async fn concatenates_root_and_cwd_docs() {
     };
 
     assert_eq!(loaded, expected);
-    assert_eq!(loaded.text(), "root doc\n\ncrate doc");
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "{}\n\n{}",
+            source_text(&root_agents, "root doc"),
+            source_text(&crate_agents, "crate doc")
+        )
+    );
     assert_eq!(
         loaded.sources().collect::<Vec<_>>(),
         vec![
@@ -1002,7 +1091,14 @@ async fn project_root_markers_are_honored_for_agents_discovery() {
     assert_eq!(discovery[1], PathUri::from_abs_path(&expected_child));
 
     let res = get_user_instructions(&cfg).await.expect("doc expected");
-    assert_eq!(res, "parent doc\n\nchild doc");
+    assert_eq!(
+        res,
+        format!(
+            "{}\n\n{}",
+            source_text(&expected_parent, "parent doc"),
+            source_text(&expected_child, "child doc")
+        )
+    );
 }
 
 #[tokio::test]
@@ -1070,7 +1166,7 @@ async fn agents_md_paths_preserve_symlinked_cwd() {
     );
 
     let res = get_user_instructions(&cfg).await.expect("doc expected");
-    assert_eq!(res, "project doc");
+    assert_eq!(res, source_text(&cfg.cwd.join("AGENTS.md"), "project doc"));
 }
 
 #[tokio::test]
@@ -1107,30 +1203,103 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
     );
     assert_eq!(
         loaded.text(),
-        format!("global doc{AGENTS_MD_SEPARATOR}project doc")
+        format!(
+            "global doc{AGENTS_MD_SEPARATOR}{}",
+            source_text(&project_agents, "project doc")
+        )
     );
 }
 
 /// AGENTS.override.md is preferred over AGENTS.md when both are present.
 #[tokio::test]
-async fn agents_local_md_preferred() {
+async fn agents_override_md_replaces_agents_md() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join(DEFAULT_AGENTS_MD_FILENAME), "versioned").unwrap();
-    fs::write(tmp.path().join(LOCAL_AGENTS_MD_FILENAME), "local").unwrap();
+    fs::write(tmp.path().join(OVERRIDE_AGENTS_MD_FILENAME), "override").unwrap();
 
     let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
 
     let res = get_user_instructions(&cfg)
         .await
-        .expect("local doc expected");
+        .expect("override doc expected");
 
-    assert_eq!(res, "local");
+    assert_eq!(
+        res,
+        source_text(&cfg.cwd.join(OVERRIDE_AGENTS_MD_FILENAME), "override")
+    );
 
     let discovery = agents_md_paths(&cfg).await.expect("discover paths");
     assert_eq!(discovery.len(), 1);
     assert_eq!(
         discovery[0].basename().as_deref(),
-        Some(LOCAL_AGENTS_MD_FILENAME)
+        Some(OVERRIDE_AGENTS_MD_FILENAME)
+    );
+}
+
+#[tokio::test]
+async fn agents_local_md_appends_to_agents_md() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join(DEFAULT_AGENTS_MD_FILENAME), "versioned").unwrap();
+    fs::write(tmp.path().join(LOCAL_AGENTS_MD_FILENAME), "local").unwrap();
+
+    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let base = cfg.cwd.join(DEFAULT_AGENTS_MD_FILENAME);
+    let local = cfg.cwd.join(LOCAL_AGENTS_MD_FILENAME);
+
+    let res = get_user_instructions(&cfg)
+        .await
+        .expect("instructions expected");
+
+    assert_eq!(
+        res,
+        format!(
+            "{}\n\n{}",
+            source_text(&base, "versioned"),
+            source_text_with_kind(&local, InstructionSourceKind::LocalAddition, "local")
+        )
+    );
+
+    let discovery = agents_md_paths(&cfg).await.expect("discover paths");
+    assert_eq!(
+        discovery,
+        vec![
+            PathUri::from_abs_path(&base),
+            PathUri::from_abs_path(&local)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn agents_local_md_appends_to_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join(DEFAULT_AGENTS_MD_FILENAME), "versioned").unwrap();
+    fs::write(tmp.path().join(OVERRIDE_AGENTS_MD_FILENAME), "override").unwrap();
+    fs::write(tmp.path().join(LOCAL_AGENTS_MD_FILENAME), "local").unwrap();
+
+    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let override_path = cfg.cwd.join(OVERRIDE_AGENTS_MD_FILENAME);
+    let local = cfg.cwd.join(LOCAL_AGENTS_MD_FILENAME);
+
+    let res = get_user_instructions(&cfg)
+        .await
+        .expect("instructions expected");
+
+    assert_eq!(
+        res,
+        format!(
+            "{}\n\n{}",
+            source_text(&override_path, "override"),
+            source_text_with_kind(&local, InstructionSourceKind::LocalAddition, "local")
+        )
+    );
+
+    let discovery = agents_md_paths(&cfg).await.expect("discover paths");
+    assert_eq!(
+        discovery,
+        vec![
+            PathUri::from_abs_path(&override_path),
+            PathUri::from_abs_path(&local),
+        ]
     );
 }
 
@@ -1152,7 +1321,10 @@ async fn uses_configured_fallback_when_agents_missing() {
         .await
         .expect("fallback doc expected");
 
-    assert_eq!(res, "example instructions");
+    assert_eq!(
+        res,
+        source_text(&cfg.cwd.join("EXAMPLE.md"), "example instructions")
+    );
 }
 
 /// AGENTS.md remains preferred when both AGENTS.md and fallbacks are present.
@@ -1174,7 +1346,7 @@ async fn agents_md_preferred_over_fallbacks() {
         .await
         .expect("AGENTS.md should win");
 
-    assert_eq!(res, "primary");
+    assert_eq!(res, source_text(&cfg.cwd.join("AGENTS.md"), "primary"));
 
     let discovery = agents_md_paths(&cfg).await.expect("discover paths");
     assert_eq!(discovery.len(), 1);
@@ -1224,7 +1396,7 @@ async fn agents_md_special_file_is_ignored() {
 #[tokio::test]
 async fn override_directory_falls_back_to_agents_md_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    fs::create_dir(tmp.path().join(LOCAL_AGENTS_MD_FILENAME)).unwrap();
+    fs::create_dir(tmp.path().join(OVERRIDE_AGENTS_MD_FILENAME)).unwrap();
     fs::write(tmp.path().join(DEFAULT_AGENTS_MD_FILENAME), "primary").unwrap();
 
     let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
@@ -1232,7 +1404,7 @@ async fn override_directory_falls_back_to_agents_md_file() {
     let res = get_user_instructions(&cfg)
         .await
         .expect("AGENTS.md should be used when override is a directory");
-    assert_eq!(res, "primary");
+    assert_eq!(res, source_text(&cfg.cwd.join("AGENTS.md"), "primary"));
 
     let discovery = agents_md_paths(&cfg).await.expect("discover paths");
     assert_eq!(discovery.len(), 1);
@@ -1257,7 +1429,7 @@ async fn skills_are_not_appended_to_agents_md() {
     let res = get_user_instructions(&cfg)
         .await
         .expect("instructions expected");
-    assert_eq!(res, "base doc");
+    assert_eq!(res, source_text(&cfg.cwd.join("AGENTS.md"), "base doc"));
 }
 
 #[tokio::test]
@@ -1285,7 +1457,232 @@ async fn apps_feature_does_not_append_to_agents_md_user_instructions() {
     let res = get_user_instructions(&cfg)
         .await
         .expect("instructions expected");
-    assert_eq!(res, "base doc");
+    assert_eq!(res, source_text(&cfg.cwd.join("AGENTS.md"), "base doc"));
+}
+
+#[tokio::test]
+async fn agents_md_expands_at_references_depth_first_and_reports_sources() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    fs::write(
+        tmp.path().join("AGENTS.md"),
+        "root doc\n@docs/one.md\n@docs/two.md",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("docs/one.md"), "one doc\n@nested.md").unwrap();
+    fs::write(tmp.path().join("docs/nested.md"), "nested doc").unwrap();
+    fs::write(tmp.path().join("docs/two.md"), "two doc").unwrap();
+
+    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let root = cfg.cwd.join("AGENTS.md");
+    let one = cfg.cwd.join("docs/one.md");
+    let nested = cfg.cwd.join("docs/nested.md");
+    let two = cfg.cwd.join("docs/two.md");
+
+    let loaded = load_agents_md(&cfg).await.expect("instructions expected");
+    let expected = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
+            InstructionEntry {
+                contents: "root doc\n@docs/one.md\n@docs/two.md".to_string(),
+                provenance: project_provenance(root.clone(), cfg.cwd.clone()),
+            },
+            InstructionEntry {
+                contents: "one doc\n@nested.md".to_string(),
+                provenance: project_provenance_with_kind(
+                    one.clone(),
+                    cfg.cwd.clone(),
+                    InstructionSourceKind::Reference,
+                ),
+            },
+            InstructionEntry {
+                contents: "nested doc".to_string(),
+                provenance: project_provenance_with_kind(
+                    nested.clone(),
+                    cfg.cwd.clone(),
+                    InstructionSourceKind::Reference,
+                ),
+            },
+            InstructionEntry {
+                contents: "two doc".to_string(),
+                provenance: project_provenance_with_kind(
+                    two.clone(),
+                    cfg.cwd.clone(),
+                    InstructionSourceKind::Reference,
+                ),
+            },
+        ],
+    };
+
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&root),
+            PathUri::from_abs_path(&one),
+            PathUri::from_abs_path(&nested),
+            PathUri::from_abs_path(&two),
+        ]
+    );
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "{}\n\n{}\n\n{}\n\n{}",
+            source_text(&root, "root doc\n@docs/one.md\n@docs/two.md"),
+            source_text_with_kind(
+                &one,
+                InstructionSourceKind::Reference,
+                "one doc\n@nested.md"
+            ),
+            source_text_with_kind(&nested, InstructionSourceKind::Reference, "nested doc"),
+            source_text_with_kind(&two, InstructionSourceKind::Reference, "two doc")
+        )
+    );
+}
+
+#[tokio::test]
+async fn agents_md_references_skip_code_and_stay_within_project_root() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    fs::write(repo.path().join("real.md"), "real doc").unwrap();
+    fs::write(repo.path().join("inline.md"), "inline doc").unwrap();
+    fs::write(repo.path().join("fenced.md"), "fenced doc").unwrap();
+    fs::write(repo.path().join("commented.md"), "commented doc").unwrap();
+    fs::write(repo.path().join("~ambiguous.md"), "ambiguous tilde doc").unwrap();
+    fs::write(repo.path().join("paren.md"), "paren doc").unwrap();
+    fs::write(repo.path().join("image.png"), "image doc").unwrap();
+    let bazel_label_path = repo
+        .path()
+        .join("io_bazel_rules_go")
+        .join("go")
+        .join("config:race");
+    fs::create_dir_all(bazel_label_path.parent().expect("bazel label parent")).unwrap();
+    fs::write(&bazel_label_path, "bazel label doc").unwrap();
+    let outside_name = format!(
+        "{}-outside.md",
+        repo.path()
+            .file_name()
+            .expect("tempdir file name")
+            .to_string_lossy()
+    );
+    let outside = repo
+        .path()
+        .parent()
+        .expect("tempdir parent")
+        .join(&outside_name);
+    fs::write(&outside, "outside doc").unwrap();
+    fs::write(
+        repo.path().join("AGENTS.md"),
+        format!(
+            "root\n`@inline.md`\n```md\n@fenced.md\n```\n<!-- @commented.md -->\n@real.md\n@~ambiguous.md\n(@paren.md)\n--@io_bazel_rules_go//go/config:race\n@image.png\n@../{outside_name}"
+        ),
+    )
+    .unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let root = cfg.cwd.join("AGENTS.md");
+    let real = cfg.cwd.join("real.md");
+
+    let loaded = load_agents_md(&cfg).await.expect("instructions expected");
+
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![PathUri::from_abs_path(&root), PathUri::from_abs_path(&real)]
+    );
+    assert!(loaded.text().contains("real doc"));
+    assert!(!loaded.text().contains("inline doc"));
+    assert!(!loaded.text().contains("fenced doc"));
+    assert!(!loaded.text().contains("bazel label doc"));
+    assert!(!loaded.text().contains("commented doc"));
+    assert!(!loaded.text().contains("paren doc"));
+    assert!(!loaded.text().contains("image doc"));
+    assert!(!loaded.text().contains("ambiguous tilde doc"));
+    assert!(!loaded.text().contains("outside doc"));
+}
+
+#[tokio::test]
+async fn agents_md_references_dedupe_canonical_aliases() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(tmp.path().join("docs")).unwrap();
+    fs::write(
+        tmp.path().join("AGENTS.md"),
+        "@docs/shared.md\n@docs-link/shared.md",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("docs/shared.md"), "shared doc").unwrap();
+    create_directory_symlink(&tmp.path().join("docs"), &tmp.path().join("docs-link"));
+
+    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let root = cfg.cwd.join("AGENTS.md");
+    let shared = cfg.cwd.join("docs/shared.md");
+
+    let loaded = load_agents_md(&cfg).await.expect("instructions expected");
+
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&root),
+            PathUri::from_abs_path(&shared),
+        ]
+    );
+    assert_eq!(loaded.text().matches("shared doc").count(), 1);
+}
+
+#[tokio::test]
+async fn agents_md_references_reject_symlink_targets_outside_project_root() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "").unwrap();
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    fs::write(outside.path().join("secret.md"), "outside symlink doc").unwrap();
+    create_directory_symlink(outside.path(), &repo.path().join("outside-link"));
+    fs::write(
+        repo.path().join("AGENTS.md"),
+        "root\n@outside-link/secret.md",
+    )
+    .unwrap();
+
+    let cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
+    let root = cfg.cwd.join("AGENTS.md");
+
+    let loaded = load_agents_md(&cfg).await.expect("instructions expected");
+
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![PathUri::from_abs_path(&root)]
+    );
+    assert!(!loaded.text().contains("outside symlink doc"));
+}
+
+#[tokio::test]
+async fn agents_md_references_are_depth_limited_and_deduplicated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "@a1.md\n@a1.md").unwrap();
+    for index in 1..=6 {
+        let next_index = index + 1;
+        fs::write(
+            tmp.path().join(format!("a{index}.md")),
+            format!("file {index}\n@a{next_index}.md"),
+        )
+        .unwrap();
+    }
+
+    let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let loaded = load_agents_md(&cfg).await.expect("instructions expected");
+
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![
+            PathUri::from_abs_path(&cfg.cwd.join("AGENTS.md")),
+            PathUri::from_abs_path(&cfg.cwd.join("a1.md")),
+            PathUri::from_abs_path(&cfg.cwd.join("a2.md")),
+            PathUri::from_abs_path(&cfg.cwd.join("a3.md")),
+            PathUri::from_abs_path(&cfg.cwd.join("a4.md")),
+            PathUri::from_abs_path(&cfg.cwd.join("a5.md")),
+        ]
+    );
+    assert_eq!(loaded.text().matches("file 1").count(), 1);
+    assert!(loaded.text().contains("file 5"));
+    assert!(!loaded.text().contains("file 6"));
 }
 
 fn create_skill(codex_home: PathBuf, name: &str, description: &str) {

@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use super::CodexHomeUserInstructionsProvider;
 use super::DEFAULT_AGENTS_MD_FILENAME;
 use super::LOCAL_AGENTS_MD_FILENAME;
+use super::OVERRIDE_AGENTS_MD_FILENAME;
 
 fn provider(home: &TempDir) -> CodexHomeUserInstructionsProvider {
     CodexHomeUserInstructionsProvider::new(
@@ -21,17 +22,27 @@ fn provider(home: &TempDir) -> CodexHomeUserInstructionsProvider {
 fn expected(
     home: &TempDir,
     filename: &str,
-    text: &str,
+    text: String,
     warnings: Vec<String>,
 ) -> LoadedUserInstructions {
     LoadedUserInstructions {
         instructions: Some(UserInstructions {
-            text: text.to_string(),
+            text,
             source: AbsolutePathBuf::try_from(home.path().join(filename))
                 .expect("absolute source path"),
         }),
         warnings,
     }
+}
+
+fn source_text(home: &TempDir, filename: &str, text: &str) -> String {
+    let path = home.path().join(filename);
+    let heading = if filename == LOCAL_AGENTS_MD_FILENAME {
+        "Local additions from"
+    } else {
+        "Instructions from"
+    };
+    format!("{heading} `{}`\n\n{text}", path.display())
 }
 
 #[cfg(unix)]
@@ -66,18 +77,82 @@ async fn missing_files_return_no_instructions() {
 async fn override_takes_precedence_over_default() {
     let home = TempDir::new().expect("temp dir");
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
-    fs::write(home.path().join(LOCAL_AGENTS_MD_FILENAME), "override").expect("write override");
+    fs::write(home.path().join(OVERRIDE_AGENTS_MD_FILENAME), "override").expect("write override");
 
     assert_eq!(
         provider(&home).load_user_instructions().await,
-        expected(&home, LOCAL_AGENTS_MD_FILENAME, "override", Vec::new())
+        expected(
+            &home,
+            OVERRIDE_AGENTS_MD_FILENAME,
+            source_text(&home, OVERRIDE_AGENTS_MD_FILENAME, "override"),
+            Vec::new()
+        )
+    );
+}
+
+#[tokio::test]
+async fn local_file_appends_to_selected_base() {
+    let home = TempDir::new().expect("temp dir");
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
+    fs::write(home.path().join(LOCAL_AGENTS_MD_FILENAME), "local").expect("write local");
+
+    assert_eq!(
+        provider(&home).load_user_instructions().await,
+        expected(
+            &home,
+            DEFAULT_AGENTS_MD_FILENAME,
+            format!(
+                "{}\n\n{}",
+                source_text(&home, DEFAULT_AGENTS_MD_FILENAME, "default"),
+                source_text(&home, LOCAL_AGENTS_MD_FILENAME, "local")
+            ),
+            Vec::new()
+        )
+    );
+}
+
+#[tokio::test]
+async fn local_file_appends_to_override() {
+    let home = TempDir::new().expect("temp dir");
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
+    fs::write(home.path().join(OVERRIDE_AGENTS_MD_FILENAME), "override").expect("write override");
+    fs::write(home.path().join(LOCAL_AGENTS_MD_FILENAME), "local").expect("write local");
+
+    assert_eq!(
+        provider(&home).load_user_instructions().await,
+        expected(
+            &home,
+            OVERRIDE_AGENTS_MD_FILENAME,
+            format!(
+                "{}\n\n{}",
+                source_text(&home, OVERRIDE_AGENTS_MD_FILENAME, "override"),
+                source_text(&home, LOCAL_AGENTS_MD_FILENAME, "local")
+            ),
+            Vec::new()
+        )
+    );
+}
+
+#[tokio::test]
+async fn local_file_can_stand_alone() {
+    let home = TempDir::new().expect("temp dir");
+    fs::write(home.path().join(LOCAL_AGENTS_MD_FILENAME), "local").expect("write local");
+
+    assert_eq!(
+        provider(&home).load_user_instructions().await,
+        expected(
+            &home,
+            LOCAL_AGENTS_MD_FILENAME,
+            source_text(&home, LOCAL_AGENTS_MD_FILENAME, "local"),
+            Vec::new()
+        )
     );
 }
 
 #[tokio::test]
 async fn empty_override_falls_back_to_trimmed_default() {
     let home = TempDir::new().expect("temp dir");
-    fs::write(home.path().join(LOCAL_AGENTS_MD_FILENAME), " \n\t").expect("write override");
+    fs::write(home.path().join(OVERRIDE_AGENTS_MD_FILENAME), " \n\t").expect("write override");
     fs::write(
         home.path().join(DEFAULT_AGENTS_MD_FILENAME),
         "\n  default instructions  \n",
@@ -89,7 +164,7 @@ async fn empty_override_falls_back_to_trimmed_default() {
         expected(
             &home,
             DEFAULT_AGENTS_MD_FILENAME,
-            "default instructions",
+            source_text(&home, DEFAULT_AGENTS_MD_FILENAME, "default instructions"),
             Vec::new()
         )
     );
@@ -98,19 +173,25 @@ async fn empty_override_falls_back_to_trimmed_default() {
 #[tokio::test]
 async fn directory_override_falls_back_to_default() {
     let home = TempDir::new().expect("temp dir");
-    fs::create_dir(home.path().join(LOCAL_AGENTS_MD_FILENAME)).expect("create override directory");
+    fs::create_dir(home.path().join(OVERRIDE_AGENTS_MD_FILENAME))
+        .expect("create override directory");
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
 
     assert_eq!(
         provider(&home).load_user_instructions().await,
-        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "default", Vec::new())
+        expected(
+            &home,
+            DEFAULT_AGENTS_MD_FILENAME,
+            source_text(&home, DEFAULT_AGENTS_MD_FILENAME, "default"),
+            Vec::new()
+        )
     );
 }
 
 #[tokio::test]
 async fn recoverable_override_read_error_warns_and_falls_back_to_default() {
     let home = TempDir::new().expect("temp dir");
-    let override_path = home.path().join(LOCAL_AGENTS_MD_FILENAME);
+    let override_path = home.path().join(OVERRIDE_AGENTS_MD_FILENAME);
     create_symlink_loop(&override_path);
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
     let read_error = fs::read(&override_path).expect_err("symlink loop should not be readable");
@@ -121,7 +202,12 @@ async fn recoverable_override_read_error_warns_and_falls_back_to_default() {
 
     assert_eq!(
         provider(&home).load_user_instructions().await,
-        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "default", vec![warning])
+        expected(
+            &home,
+            DEFAULT_AGENTS_MD_FILENAME,
+            source_text(&home, DEFAULT_AGENTS_MD_FILENAME, "default"),
+            vec![warning]
+        )
     );
 }
 
@@ -140,7 +226,7 @@ async fn invalid_utf8_is_lossy() {
         expected(
             &home,
             DEFAULT_AGENTS_MD_FILENAME,
-            "global\u{fffd} doc",
+            source_text(&home, DEFAULT_AGENTS_MD_FILENAME, "global\u{fffd} doc"),
             Vec::new()
         )
     );

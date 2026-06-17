@@ -25,6 +25,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::RecordingUserInstructionsProvider;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
@@ -91,7 +92,13 @@ fn expected_instruction_fragment(cwd: &AbsolutePathBuf, contents: &str) -> Strin
     format!("# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
-fn expected_provider_only_instruction_fragment(contents: &str) -> String {
+fn project_source_text(path: &AbsolutePathBuf, contents: &str) -> String {
+    let path = path.display();
+    format!("Instructions from `{path}`\n\n{contents}")
+}
+
+fn expected_provider_only_instruction_fragment(source: &AbsolutePathBuf, contents: &str) -> String {
+    let contents = project_source_text(source, contents);
     format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>")
 }
 
@@ -162,6 +169,46 @@ async fn agents_override_is_preferred_over_agents_md() -> Result<()> {
     assert!(
         !instructions.contains("base doc"),
         "expected AGENTS.md to be ignored when override exists: {instructions}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_local_is_appended_to_selected_agents_base() -> Result<()> {
+    // TODO(anp): Remove after instruction-source helpers use target-native paths.
+    skip_if_wine_exec!(Ok(()), "requires native cross-OS instruction-source paths");
+    let instructions =
+        agents_instructions(test_codex().with_workspace_setup(|cwd, fs| async move {
+            let agents_md = cwd.join("AGENTS.md");
+            let local_md = cwd.join("AGENTS.local.md");
+            fs.write_file(
+                &PathUri::from_host_native_path(&agents_md)?,
+                b"base doc".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            fs.write_file(
+                &PathUri::from_host_native_path(&local_md)?,
+                b"local doc".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }))
+        .await?;
+
+    assert!(
+        instructions.contains("base doc"),
+        "expected AGENTS.md contents: {instructions}"
+    );
+    assert!(
+        instructions.contains("local doc"),
+        "expected AGENTS.local.md contents: {instructions}"
+    );
+    assert!(
+        instructions.contains("Local additions from"),
+        "expected AGENTS.local.md source label: {instructions}"
     );
 
     Ok(())
@@ -391,7 +438,11 @@ async fn selected_environment_sources_match_model_visible_instructions() -> Resu
         .into_iter()
         .find(|text| text.starts_with("# AGENTS.md instructions"))
         .expect("instructions message");
-    assert!(instructions.contains("global doc\n\n--- project-doc ---\n\nproject doc"));
+    assert!(instructions.contains(&format!(
+        "{}\n\n--- project-doc ---\n\n{}",
+        project_source_text(&global_agents, "global doc"),
+        project_source_text(&project_agents, "project doc")
+    )));
 
     Ok(())
 }
@@ -476,6 +527,10 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
     let instruction_fragments = instruction_fragments(&response_mock.single_request());
     assert_eq!(instruction_fragments.len(), 1);
     assert!(instruction_fragments[0].contains(GLOBAL_INSTRUCTIONS));
+    assert!(
+        instruction_fragments[0]
+            .contains(&project_source_text(&global_source, GLOBAL_INSTRUCTIONS))
+    );
     assert!(!instruction_fragments[0].contains(PROJECT_INSTRUCTIONS));
 
     Ok(())
@@ -550,8 +605,11 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     // both files at the reported source paths now contain different text.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
-    let expected_contents =
-        format!("{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}");
+    let expected_contents = format!(
+        "{}\n\n{PROJECT_SEPARATOR}\n\n{}",
+        project_source_text(&global_source, GLOBAL_INSTRUCTIONS),
+        project_source_text(&project_source, PROJECT_INSTRUCTIONS)
+    );
     let expected_fragment = expected_instruction_fragment(&test.config.cwd, &expected_contents);
     let fragments = instruction_fragments(&requests[0]);
     assert_eq!(fragments, vec![expected_fragment.clone()]);
@@ -641,6 +699,7 @@ async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapsho
         });
     let test = builder.build_with_remote_and_local_env(&server).await?;
     let remote_source = test.config.cwd.join(GLOBAL_AGENTS_FILENAME);
+    let local_source_abs: AbsolutePathBuf = local_source.clone().try_into()?;
     let thread = test
         .thread_manager
         .start_thread_with_options(StartThreadOptions {
@@ -697,9 +756,17 @@ async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapsho
     submit_thread_turn(&thread.thread, "second multi-environment turn").await?;
 
     let contents = format!(
-        "{GLOBAL_INSTRUCTIONS}\n\nfor `{REMOTE_ENVIRONMENT_ID}` with root {}\n\nremote project instructions\n\nfor `{LOCAL_ENVIRONMENT_ID}` with root {}\n\nlocal project instructions",
+        concat!(
+            "{}\n\nfor `{}` with root {}\n\n{}",
+            "\n\nfor `{}` with root {}\n\n{}",
+        ),
+        project_source_text(&global_source, GLOBAL_INSTRUCTIONS),
+        REMOTE_ENVIRONMENT_ID,
         PathUri::from_abs_path(&test.config.cwd).inferred_native_path_string(),
+        project_source_text(&remote_source, "remote project instructions"),
+        LOCAL_ENVIRONMENT_ID,
         local_root.path().display(),
+        project_source_text(&local_source_abs, "local project instructions"),
     );
     let expected =
         format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>");
@@ -748,7 +815,7 @@ async fn invalid_utf8_global_instructions_are_lossy() -> Result<()> {
         vec![PathUri::from_abs_path(&source)]
     );
     let expected_fragment =
-        expected_provider_only_instruction_fragment("global\u{FFFD}instructions");
+        expected_provider_only_instruction_fragment(&source, "global\u{FFFD}instructions");
     assert_single_instruction_fragment(&response_mock.single_request(), &expected_fragment);
 
     Ok(())
@@ -834,7 +901,8 @@ async fn cold_resume_replays_rendered_instructions_but_reports_current_config_so
         Some(initial_input.as_slice()),
         "cold resume should replay the original structured input prefix"
     );
-    let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+    let expected_fragment =
+        expected_provider_only_instruction_fragment(&old_source, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
     assert_single_instruction_fragment(&requests[1], &expected_fragment);
 
@@ -940,7 +1008,8 @@ async fn fork_replays_rendered_instructions_from_shared_history() -> Result<()> 
         Some(parent_input.as_slice()),
         "fork should replay the parent's original structured input prefix"
     );
-    let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+    let expected_fragment =
+        expected_provider_only_instruction_fragment(&source, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
     assert_single_instruction_fragment(&requests[1], &expected_fragment);
 
@@ -1075,7 +1144,8 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     .map_err(|_| anyhow!("timed out waiting for the subagent request"))?;
 
     // Assert parent and child report and render the parent's creation-time snapshot exactly once.
-    let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+    let expected_fragment =
+        expected_provider_only_instruction_fragment(&source, OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&seed_request, &expected_fragment);
     assert_single_instruction_fragment(&spawn_request, &expected_fragment);
     assert_single_instruction_fragment(&child_request, &expected_fragment);

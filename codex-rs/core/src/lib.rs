@@ -131,6 +131,7 @@ pub(crate) mod agents_md;
 pub use agents_md::DEFAULT_AGENTS_MD_FILENAME;
 pub use agents_md::LOCAL_AGENTS_MD_FILENAME;
 pub use agents_md::LoadedAgentsMd;
+pub use agents_md::OVERRIDE_AGENTS_MD_FILENAME;
 mod rollout;
 mod rollout_budget;
 pub(crate) mod safety;

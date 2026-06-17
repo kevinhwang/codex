@@ -72,3 +72,43 @@ async fn exec_prefers_workspace_agents_override_md() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_appends_workspace_agents_local_md() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    std::fs::write(test.cwd_path().join("AGENTS.md"), "base instructions")?;
+    std::fs::write(
+        test.cwd_path().join("AGENTS.local.md"),
+        "local instructions",
+    )?;
+
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp1"),
+        responses::ev_assistant_message("m1", "fixture hello"),
+        responses::ev_completed("resp1"),
+    ]);
+    let response_mock = responses::mount_sse_once(&server, body).await;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("tell me something")
+        .assert()
+        .success();
+
+    let user_messages = response_mock.single_request().message_input_texts("user");
+    assert!(
+        user_messages
+            .iter()
+            .any(|text| text.contains("base instructions")),
+        "request should include AGENTS.md instructions: {user_messages:?}"
+    );
+    assert!(
+        user_messages
+            .iter()
+            .any(|text| text.contains("local instructions")),
+        "request should include AGENTS.local.md instructions: {user_messages:?}"
+    );
+
+    Ok(())
+}
